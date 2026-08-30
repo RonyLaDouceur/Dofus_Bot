@@ -1,0 +1,9 @@
+# Python bytecode and virtual environments
+__pycache__/
+*.py[cod]
+.venv/
+.venv-1/
+
+# Runtime output and temporary debugging captures
+logs/
+debug_*.png

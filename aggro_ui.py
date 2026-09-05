@@ -1,3 +1,4 @@
+import ctypes
 import queue
 import logging
 from logging.handlers import RotatingFileHandler
@@ -63,7 +64,7 @@ class AggroApp(tk.Tk):
         form.pack(fill="x", pady=(0, 10))
 
         ttk.Label(form, text="Séuil min :").grid(row=0, column=0, sticky="w", padx=(0, 8), pady=4)
-        self.score_var = tk.StringVar(value="0.015")
+        self.score_var = tk.StringVar(value="0.7")
         ttk.Entry(form, textvariable=self.score_var, width=12).grid(row=0, column=1, sticky="w", pady=4)
 
         ttk.Label(form, text="Délai scan (ms) :").grid(row=0, column=2, sticky="w", padx=(12, 4), pady=4)
@@ -81,7 +82,10 @@ class AggroApp(tk.Tk):
         ttk.Entry(form, textvariable=self.roi_var, width=30).grid(row=2, column=1, columnspan=2, sticky="w", pady=4)
         ttk.Button(form, text="Sélectionner zone", command=self.select_roi_visually).grid(row=2, column=3, sticky="w", padx=(6, 0), pady=4)
         ttk.Button(form, text="Plein écran", command=self._on_monitor_selected).grid(row=2, column=4, sticky="w", padx=(4, 0), pady=4)
-        ttk.Label(form, text="Mode : comparaison de frames").grid(row=3, column=1, columnspan=3, sticky="w", pady=4)
+        ttk.Label(form, text="Délai clic → F1 (ms) :").grid(row=3, column=0, sticky="w", padx=(0, 8), pady=4)
+        self.click_delay_var = tk.StringVar(value="200")
+        ttk.Entry(form, textvariable=self.click_delay_var, width=7).grid(row=3, column=1, sticky="w", pady=4)
+        ttk.Label(form, text="Mode : comparaison de frames").grid(row=3, column=2, columnspan=3, sticky="w", pady=4)
 
         buttons = ttk.Frame(main)
         buttons.pack(fill="x", pady=(4, 10))
@@ -182,6 +186,7 @@ class AggroApp(tk.Tk):
             threshold = float(self.score_var.get())
             roi = self.parse_roi()
             scan_delay = max(0, int(self.delay_var.get())) / 1000.0
+            click_delay = max(0, int(self.click_delay_var.get())) / 1000.0
         except Exception as exc:
             messagebox.showerror("Paramètre invalide", str(exc))
             return
@@ -189,11 +194,11 @@ class AggroApp(tk.Tk):
         self.running = True
         self.stop_event.clear()
         self.status_var.set("Démarrage...")
-        self.log_message(f"Démarrage du bot | mode=frames | seuil={threshold} | délai={int(scan_delay*1000)}ms")
+        self.log_message(f"Démarrage du bot | mode=frames | seuil={threshold} | délai={int(scan_delay*1000)}ms | clic->F1={int(click_delay*1000)}ms")
         self.log_message(f"Capture : x={roi[0]} y={roi[1]} w={roi[2]} h={roi[3]}")
         self.bot_thread = threading.Thread(
             target=self.bot_loop,
-            args=(threshold, roi, scan_delay),
+            args=(threshold, roi, scan_delay, click_delay),
             daemon=True,
         )
         self.bot_thread.start()
@@ -342,7 +347,7 @@ class AggroApp(tk.Tk):
             return None
         return (left, top, right, bottom)
 
-    def bot_loop(self, threshold: float, roi, scan_delay: float = 0.05):
+    def bot_loop(self, threshold: float, roi, scan_delay: float = 0.05, click_delay: float = 0.2):
         templates = [(p, self._load_template(p)) for p in self.templates]
         templates = [(p, img) for p, img in templates if img is not None]
         if not templates:
@@ -375,11 +380,17 @@ class AggroApp(tk.Tk):
                         time.sleep(0.5)
                         continue
 
-                    gray = cv2.cvtColor(shot[:, :, :3], cv2.COLOR_BGR2GRAY)
+                    frame_bgr = shot[:, :, :3]
+                    frame_gray = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2GRAY)
+                    frame_gray_small = cv2.resize(
+                        frame_gray, None,
+                        fx=self.MATCH_DOWNSCALE, fy=self.MATCH_DOWNSCALE,
+                        interpolation=cv2.INTER_AREA,
+                    )
                     if not debug_saved:
                         debug_path = Path(__file__).resolve().parent / "debug_frame.png"
                         try:
-                            Image.fromarray(gray).save(str(debug_path))
+                            Image.fromarray(cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2RGB)).save(str(debug_path))
                             self.log_message(f"Frame debug : {debug_path} ({shot.shape[1]}x{shot.shape[0]}px)")
                         except Exception as exc:
                             self.log_message(f"Erreur debug : {exc}")
@@ -393,7 +404,7 @@ class AggroApp(tk.Tk):
                         reverse=True,
                     )
                     for tpl_path, template_variants, tpl_label in templates_to_match:
-                        match, score = self._find_match(gray, template_variants, threshold)
+                        match, score = self._find_match(frame_gray_small, frame_bgr, template_variants, threshold)
                         if score > best_score_overall:
                             best_score_overall = score
                             best_name = tpl_label
@@ -436,7 +447,7 @@ class AggroApp(tk.Tk):
                     self.log_message(f"Cible : {best_name} score={score:.3f} | clic ({cx},{cy})")
                     pyautogui.click(cx, cy)
                     blocked_target = (best_name, cx, cy)
-                    time.sleep(0.12)
+                    time.sleep(click_delay)
                     pyautogui.press("f1")
                     self.log_message("Clic + F1 envoyés.")
                     time.sleep(1.0)
@@ -508,20 +519,30 @@ class AggroApp(tk.Tk):
     def _load_template(self, path: Path):
         if not path.exists():
             return None
-        image = cv2.imread(str(path), cv2.IMREAD_GRAYSCALE)
+        image = cv2.imread(str(path), cv2.IMREAD_COLOR)
         return image if image is not None else None
 
-    @staticmethod
-    def _prepare_template_variants(template_image):
+    MATCH_DOWNSCALE = 0.5  # recherche grise sur une image 2x plus petite (~3x plus rapide), la couleur est vérifiée en pleine résolution ensuite
+
+    @classmethod
+    def _prepare_template_variants(cls, template_image):
         variants = []
         for scale in (0.9, 1.0, 1.1):
             template_w = max(1, int(template_image.shape[1] * scale))
             template_h = max(1, int(template_image.shape[0] * scale))
-            variants.append(cv2.resize(
+            color = cv2.resize(
                 template_image,
                 (template_w, template_h),
                 interpolation=cv2.INTER_NEAREST,
-            ))
+            )
+            gray_small = cv2.resize(
+                cv2.cvtColor(color, cv2.COLOR_BGR2GRAY),
+                None,
+                fx=cls.MATCH_DOWNSCALE,
+                fy=cls.MATCH_DOWNSCALE,
+                interpolation=cv2.INTER_AREA,
+            )
+            variants.append((gray_small, color))
         return variants
 
     def capture_roi(self, roi, monitor_index=1):
@@ -536,27 +557,53 @@ class AggroApp(tk.Tk):
         except Exception:
             return None
 
-    def _find_match(self, edge_frame, template_variants, threshold):
-        """Un seul matchTemplate par échelle (pas de recadrages multiples) : avec
-        des dizaines de templates chargés, l'ancien recadrage x4 par échelle rendait
-        chaque scan très lent dès qu'aucune cible ne matchait vite (voir logs :
-        plusieurs dizaines de secondes de silence après quelques clics)."""
+    @staticmethod
+    def _color_confirm(frame_bgr, template_color, x, y, w, h):
+        """Corrélation couleur sur le seul emplacement trouvé en gris (coût quasi
+        nul : un matchTemplate sur un patch de la taille du template, pas une
+        recherche). Sert à écarter les faux positifs (ex. texture de rocher qui
+        matche la silhouette d'un mob en niveaux de gris mais pas sa couleur)."""
+        if x < 0 or y < 0 or y + h > frame_bgr.shape[0] or x + w > frame_bgr.shape[1]:
+            return 0.0
+        patch = frame_bgr[y:y + h, x:x + w]
+        result = cv2.matchTemplate(patch, template_color, cv2.TM_CCOEFF_NORMED)
+        return float(result[0, 0])
+
+    def _find_match(self, frame_gray_small, frame_bgr, template_variants, threshold, gray_floor=0.45):
+        """Recherche en 2 temps : un matchTemplate en niveaux de gris, sur une image
+        réduite (MATCH_DOWNSCALE), localise la meilleure position par échelle ; la
+        couleur n'est vérifiée qu'à cet unique endroit, en pleine résolution (voir
+        _color_confirm), au lieu de refaire toute la recherche en couleur sur 3
+        canaux en pleine résolution (beaucoup plus lent, voir logs : gros
+        ralentissements entre deux détections après le passage en matching
+        couleur)."""
         best = None
         best_score = 0.0
-        for scaled_tpl in template_variants:
-            template_h, template_w = scaled_tpl.shape[:2]
-            if template_w >= edge_frame.shape[1] or template_h >= edge_frame.shape[0]:
+        inv_scale = 1.0 / self.MATCH_DOWNSCALE
+        for gray_tpl_small, color_tpl in template_variants:
+            small_h, small_w = gray_tpl_small.shape[:2]
+            if small_w >= frame_gray_small.shape[1] or small_h >= frame_gray_small.shape[0]:
                 continue
 
-            result = cv2.matchTemplate(edge_frame, scaled_tpl, cv2.TM_CCOEFF_NORMED)
-            _, score, _, loc = cv2.minMaxLoc(result)
+            result = cv2.matchTemplate(frame_gray_small, gray_tpl_small, cv2.TM_CCOEFF_NORMED)
+            _, gray_score, _, loc = cv2.minMaxLoc(result)
+            if gray_score < gray_floor:
+                continue
+
+            template_h, template_w = color_tpl.shape[:2]
+            x, y = int(loc[0] * inv_scale), int(loc[1] * inv_scale)
+            score = self._color_confirm(frame_bgr, color_tpl, x, y, template_w, template_h)
             if score > best_score:
                 best_score = score
             if score >= threshold and (best is None or score > best[4]):
-                best = (loc[0], loc[1], template_w, template_h, float(score))
+                best = (x, y, template_w, template_h, score)
         return best, best_score
 
 
 if __name__ == "__main__":
+    try:
+        ctypes.windll.user32.SetProcessDPIAware()
+    except Exception:
+        pass
     app = AggroApp()
     app.mainloop()

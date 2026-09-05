@@ -3,3 +3,4 @@ numpy
 mss
 pyautogui
 Pillow
+customtkinter

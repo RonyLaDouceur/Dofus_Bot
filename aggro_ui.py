@@ -6,9 +6,10 @@ from logging.handlers import RotatingFileHandler
 import threading
 import time
 from pathlib import Path
-from tkinter import messagebox, ttk
+from tkinter import messagebox
 import tkinter as tk
 
+import customtkinter as ctk
 from PIL import Image
 
 import cv2
@@ -16,16 +17,32 @@ import mss
 import numpy as np
 import pyautogui
 
+ctk.set_appearance_mode("Dark")
+ctk.set_default_color_theme("blue")
+
 user32 = ctypes.windll.user32
-user32.WindowFromPoint.restype = wintypes.HWND
-user32.WindowFromPoint.argtypes = [wintypes.POINT]
 user32.ScreenToClient.argtypes = [wintypes.HWND, ctypes.POINTER(wintypes.POINT)]
+user32.ClientToScreen.argtypes = [wintypes.HWND, ctypes.POINTER(wintypes.POINT)]
 user32.PostMessageW.argtypes = [wintypes.HWND, wintypes.UINT, wintypes.WPARAM, wintypes.LPARAM]
 user32.PostMessageW.restype = wintypes.BOOL
 user32.MapVirtualKeyW.argtypes = [wintypes.UINT, wintypes.UINT]
 user32.MapVirtualKeyW.restype = wintypes.UINT
 user32.VkKeyScanW.argtypes = [wintypes.WCHAR]
 user32.VkKeyScanW.restype = ctypes.c_short
+
+WNDENUMPROC = ctypes.WINFUNCTYPE(wintypes.BOOL, wintypes.HWND, wintypes.LPARAM)
+user32.EnumWindows.argtypes = [WNDENUMPROC, wintypes.LPARAM]
+user32.EnumWindows.restype = wintypes.BOOL
+user32.IsWindowVisible.argtypes = [wintypes.HWND]
+user32.IsWindowVisible.restype = wintypes.BOOL
+user32.IsWindow.argtypes = [wintypes.HWND]
+user32.IsWindow.restype = wintypes.BOOL
+user32.GetWindowTextLengthW.argtypes = [wintypes.HWND]
+user32.GetWindowTextLengthW.restype = ctypes.c_int
+user32.GetWindowTextW.argtypes = [wintypes.HWND, wintypes.LPWSTR, ctypes.c_int]
+user32.GetWindowTextW.restype = ctypes.c_int
+user32.GetClientRect.argtypes = [wintypes.HWND, ctypes.POINTER(wintypes.RECT)]
+user32.GetClientRect.restype = wintypes.BOOL
 
 WM_LBUTTONDOWN = 0x0201
 WM_LBUTTONUP = 0x0202
@@ -35,14 +52,35 @@ MK_LBUTTON = 0x0001
 VK_F1 = 0x70
 VK_SHIFT = 0x10
 
+# Palette "neo" sombre : fond quasi-noir, cartes légèrement plus claires, un seul
+# accent bleu néon électrique + un rouge réservé aux actions d'arrêt.
+BG_APP = "#0b0e14"
+BG_CARD = "#12161f"
+BORDER = "#232a38"
+TEXT_PRIMARY = "#e7ecf5"
+TEXT_MUTED = "#7d8494"
+ACCENT = "#2f8fae"
+ACCENT_HOVER = "#3aa4c2"
+ACCENT_TEXT = "#eef8fb"
+DANGER = "#c85a6e"
+DANGER_HOVER = "#d5717f"
+DANGER_TEXT = "#fbecee"
+NEUTRAL = "#1b2130"
+NEUTRAL_HOVER = "#262e42"
+NEUTRAL_TEXT = "#c7cede"
+FONT_BASE = ("Segoe UI", 10)
+FONT_BOLD = ("Segoe UI", 10, "bold")
+FONT_BUTTON = ("Segoe UI", 12, "bold")
+RADIUS_CARD = 14
+RADIUS_CONTROL = 8
 
-class AggroApp(tk.Tk):
+
+class AggroApp(ctk.CTk):
     def __init__(self):
         super().__init__()
         self.title("Aggro UI")
-        self.geometry("620x520")
-        self.minsize(620, 520)
-        self.configure(bg="#f4f4f4")
+        self.minsize(480, 520)
+        self.configure(fg_color=BG_APP)
         self.attributes("-topmost", True)
         self.icon_path = Path(__file__).with_name("app_icon.ico")
         if self.icon_path.exists():
@@ -59,14 +97,15 @@ class AggroApp(tk.Tk):
         self.logger = self._build_logger()
         self.templates = []
         self.dungeon_markers = []
-        self.selected_template = None
+        self._capture_widget = None  # évite d'ouvrir plusieurs fenêtres de capture en même temps
         self.running = False
         self.stop_event = threading.Event()
         self.bot_thread = None
         self.dungeon_active = False
         self.game_hwnd = None
-        self._monitors = []        # liste des moniteurs mss (sans le virtuel global)
-        self._monitor_index = 1    # index mss 1-base
+        self.selected_hwnd = None  # fenêtre du jeu choisie dans la liste déroulante
+        self._window_handles = []  # [(hwnd, titre)] correspondant aux entrées du combobox
+        self._window_title_to_hwnd = {}  # étiquette combobox -> hwnd
 
         self._log_queue = queue.Queue()
         self._build_ui()
@@ -76,70 +115,104 @@ class AggroApp(tk.Tk):
         self.load_templates()
         self.load_dungeon_markers()
         self.after(50, self._drain_log_queue)
-        self.after(100, self._populate_monitors)
+        self.after(100, self._populate_windows)
+
+    def _card(self, parent, **pack_opts):
+        card = ctk.CTkFrame(parent, corner_radius=RADIUS_CARD, fg_color=BG_CARD, border_width=1, border_color=BORDER)
+        card.pack(fill="x", pady=(0, 8), **pack_opts)
+        return card
+
+    def _button(self, parent, text, command, kind="neutral", **kwargs):
+        palette = {
+            "accent": (ACCENT, ACCENT_HOVER, ACCENT_TEXT),
+            "danger": (DANGER, DANGER_HOVER, DANGER_TEXT),
+            "neutral": (NEUTRAL, NEUTRAL_HOVER, NEUTRAL_TEXT),
+        }[kind]
+        fg, hover, text_color = palette
+        kwargs.setdefault("height", 34)
+        return ctk.CTkButton(
+            parent, text=text, command=command,
+            corner_radius=RADIUS_CONTROL, fg_color=fg, hover_color=hover, text_color=text_color,
+            font=FONT_BUTTON, **kwargs,
+        )
 
     def _build_ui(self):
-        main = ttk.Frame(self, padding=12)
-        main.pack(fill="both", expand=True)
+        main = ctk.CTkFrame(self, fg_color="transparent")
+        main.pack(fill="both", expand=True, padx=12, pady=12)
 
-        ttk.Label(main, text="Templates", font=("Segoe UI", 11, "bold")).pack(anchor="w")
-        self.template_list = tk.Listbox(main, height=12, exportselection=False)
-        self.template_list.pack(fill="x", pady=(6, 10))
-        self.template_list.bind("<<ListboxSelect>>", self.on_template_selected)
+        # --- Templates -------------------------------------------------
+        templates_card = self._card(main)
+        templates_row = ctk.CTkFrame(templates_card, fg_color="transparent")
+        templates_row.pack(fill="x", padx=12, pady=10)
+        ctk.CTkLabel(templates_row, text="Templates", font=FONT_BOLD, text_color=TEXT_PRIMARY).pack(side="left")
+        self.templates_count_var = tk.StringVar(value="0 chargé(s)")
+        ctk.CTkLabel(templates_row, textvariable=self.templates_count_var, font=FONT_BASE, text_color=TEXT_MUTED).pack(side="left", padx=(8, 0))
+        self._button(templates_row, "📂 Ouvrir le dossier", self.open_template_folder, kind="neutral").pack(side="right")
 
-        form = ttk.Frame(main)
-        form.pack(fill="x", pady=(0, 10))
+        # --- Paramètres --------------------------------------------------
+        settings_card = self._card(main)
+        ctk.CTkLabel(settings_card, text="Paramètres", font=FONT_BOLD, text_color=TEXT_PRIMARY).grid(row=0, column=0, columnspan=5, sticky="w", padx=12, pady=(10, 6))
 
-        ttk.Label(form, text="Séuil min :").grid(row=0, column=0, sticky="w", padx=(0, 8), pady=4)
+        ctk.CTkLabel(settings_card, text="Seuil min :", text_color=TEXT_PRIMARY).grid(row=1, column=0, sticky="w", padx=(12, 6), pady=3)
         self.score_var = tk.StringVar(value="0.7")
-        ttk.Entry(form, textvariable=self.score_var, width=12).grid(row=0, column=1, sticky="w", pady=4)
+        ctk.CTkEntry(settings_card, textvariable=self.score_var, width=64, height=26, corner_radius=RADIUS_CONTROL, fg_color=NEUTRAL, border_width=0, text_color=TEXT_PRIMARY).grid(row=1, column=1, sticky="w", pady=3)
 
-        ttk.Label(form, text="Délai scan (ms) :").grid(row=0, column=2, sticky="w", padx=(12, 4), pady=4)
-        self.delay_var = tk.StringVar(value="50")
-        ttk.Entry(form, textvariable=self.delay_var, width=7).grid(row=0, column=3, sticky="w", pady=4)
-
-        ttk.Label(form, text="Écran :").grid(row=1, column=0, sticky="w", padx=(0, 8), pady=4)
-        self.monitor_combo = ttk.Combobox(form, state="readonly", width=50)
-        self.monitor_combo.grid(row=1, column=1, columnspan=3, sticky="w", pady=4)
-        self.monitor_combo.bind("<<ComboboxSelected>>", self._on_monitor_selected)
-        ttk.Button(form, text="🔄", command=self._populate_monitors, width=3).grid(row=1, column=4, sticky="w", padx=(4, 0), pady=4)
-
-        ttk.Label(form, text="Zone :").grid(row=2, column=0, sticky="w", padx=(0, 8), pady=4)
-        self.roi_var = tk.StringVar(value="")
-        ttk.Entry(form, textvariable=self.roi_var, width=30).grid(row=2, column=1, columnspan=2, sticky="w", pady=4)
-        ttk.Button(form, text="Sélectionner zone", command=self.select_roi_visually).grid(row=2, column=3, sticky="w", padx=(6, 0), pady=4)
-        ttk.Button(form, text="Plein écran", command=self._on_monitor_selected).grid(row=2, column=4, sticky="w", padx=(4, 0), pady=4)
-        ttk.Label(form, text="Délai clic → F1 (ms) :").grid(row=3, column=0, sticky="w", padx=(0, 8), pady=4)
+        ctk.CTkLabel(settings_card, text="Délai clic → F1 (ms) :", text_color=TEXT_PRIMARY).grid(row=1, column=2, sticky="w", padx=(14, 6), pady=3)
         self.click_delay_var = tk.StringVar(value="200")
-        ttk.Entry(form, textvariable=self.click_delay_var, width=7).grid(row=3, column=1, sticky="w", pady=4)
-        ttk.Label(form, text="Mode : comparaison de frames").grid(row=3, column=2, columnspan=3, sticky="w", pady=4)
+        ctk.CTkEntry(settings_card, textvariable=self.click_delay_var, width=56, height=26, corner_radius=RADIUS_CONTROL, fg_color=NEUTRAL, border_width=0, text_color=TEXT_PRIMARY).grid(row=1, column=3, sticky="w", pady=3)
+
+        settings_card.grid_columnconfigure(4, weight=1)
+
+        ctk.CTkLabel(settings_card, text="Fenêtre du jeu :", text_color=TEXT_PRIMARY).grid(row=2, column=0, sticky="w", padx=(12, 6), pady=3)
+        window_row = ctk.CTkFrame(settings_card, fg_color="transparent")
+        window_row.grid(row=2, column=1, columnspan=4, sticky="ew", padx=(0, 12), pady=3)
+        self.window_combo = ctk.CTkComboBox(
+            window_row, height=26, corner_radius=RADIUS_CONTROL, fg_color=NEUTRAL, border_width=0,
+            text_color=TEXT_PRIMARY, button_color=ACCENT, button_hover_color=ACCENT_HOVER,
+            dropdown_fg_color=NEUTRAL, dropdown_text_color=TEXT_PRIMARY, dropdown_hover_color=NEUTRAL_HOVER,
+            state="readonly", command=self._on_window_selected,
+        )
+        self.window_combo.pack(side="left", fill="x", expand=True, padx=(0, 6))
+        self._button(window_row, "🔄", self._populate_windows, kind="neutral", width=30, height=26).pack(side="left")
 
         self.background_input_var = tk.BooleanVar(value=True)
-        ttk.Checkbutton(
-            form,
+        ctk.CTkCheckBox(
+            settings_card,
             text="Clic/touche en arrière-plan (ne bouge pas ta souris)",
             variable=self.background_input_var,
-        ).grid(row=4, column=0, columnspan=5, sticky="w", pady=(4, 0))
+            corner_radius=5, checkbox_width=18, checkbox_height=18,
+            fg_color=ACCENT, hover_color=ACCENT_HOVER, text_color=TEXT_PRIMARY,
+        ).grid(row=3, column=0, columnspan=5, sticky="w", padx=12, pady=(6, 10))
 
-        buttons = ttk.Frame(main)
-        buttons.pack(fill="x", pady=(4, 10))
-        ttk.Button(buttons, text="Démarrer", command=self.start_bot).pack(side="left", padx=(0, 8))
-        ttk.Button(buttons, text="Arrêter", command=self.stop_bot).pack(side="left", padx=(0, 8))
-        ttk.Button(buttons, text="Ajouter un template", command=self.open_template_capture).pack(side="left", padx=(0, 8))
-        ttk.Button(buttons, text="📸 Tester capture", command=self.test_capture).pack(side="left")
+        # --- Actions principales ------------------------------------------
+        buttons = ctk.CTkFrame(main, fg_color="transparent")
+        buttons.pack(fill="x", pady=(0, 8))
+        self._button(buttons, "▶ Démarrer", self.start_bot, kind="accent").pack(side="left", fill="x", expand=True, padx=(0, 6))
+        self._button(buttons, "■ Arrêter", self.stop_bot, kind="danger").pack(side="left", fill="x", expand=True, padx=(0, 6))
+        self._button(buttons, "Ajouter un template", self.open_template_capture, kind="neutral").pack(side="left", fill="x", expand=True, padx=(0, 6))
+        self._button(buttons, "📸 Tester capture", self.test_capture, kind="neutral").pack(side="left", fill="x", expand=True)
 
-        dungeon_buttons = ttk.Frame(main)
-        dungeon_buttons.pack(fill="x", pady=(0, 10))
-        ttk.Button(dungeon_buttons, text="🏰 Lancer un donjon (F8)", command=self.start_dungeon).pack(side="left", padx=(0, 8))
-        ttk.Button(dungeon_buttons, text="Sortir du mode donjon", command=self.stop_dungeon).pack(side="left", padx=(0, 8))
-        ttk.Button(dungeon_buttons, text="Capturer repère sortie donjon", command=self.open_dungeon_marker_capture).pack(side="left", padx=(0, 8))
-        ttk.Button(dungeon_buttons, text="🔄", command=self.load_dungeon_markers, width=3).pack(side="left")
+        # --- Donjon ---------------------------------------------------
+        dungeon_card = self._card(main)
+        ctk.CTkLabel(dungeon_card, text="Donjon", font=FONT_BOLD, text_color=TEXT_PRIMARY).pack(anchor="w", padx=12, pady=(10, 6))
+        dungeon_buttons = ctk.CTkFrame(dungeon_card, fg_color="transparent")
+        dungeon_buttons.pack(fill="x", padx=12, pady=(0, 10))
+        self._button(dungeon_buttons, "🏰 Lancer (F8)", self.start_dungeon, kind="accent").pack(side="left", fill="x", expand=True, padx=(0, 6))
+        self._button(dungeon_buttons, "Sortir du mode donjon", self.stop_dungeon, kind="danger").pack(side="left", fill="x", expand=True, padx=(0, 6))
+        self._button(dungeon_buttons, "Capturer repère sortie", self.open_dungeon_marker_capture, kind="neutral").pack(side="left", fill="x", expand=True, padx=(0, 6))
+        self._button(dungeon_buttons, "🔄", self.load_dungeon_markers, kind="neutral", width=30).pack(side="left")
 
-        ttk.Label(main, text="Log", font=("Segoe UI", 11, "bold")).pack(anchor="w")
+        # --- Journal -------------------------------------------------
+        header_row = ctk.CTkFrame(main, fg_color="transparent")
+        header_row.pack(fill="x")
+        ctk.CTkLabel(header_row, text="Journal", font=FONT_BOLD, text_color=TEXT_PRIMARY).pack(side="left")
         self.status_var = tk.StringVar(value="Prêt")
-        ttk.Label(main, textvariable=self.status_var).pack(anchor="w", pady=(0, 4))
-        self.log = tk.Text(main, height=12, state="disabled", bg="#ffffff")
-        self.log.pack(fill="both", expand=True)
+        ctk.CTkLabel(header_row, textvariable=self.status_var, font=FONT_BASE, text_color=ACCENT).pack(side="left", padx=(10, 0))
+        self.log = ctk.CTkTextbox(
+            main, corner_radius=RADIUS_CARD, fg_color=BG_CARD, border_width=1, border_color=BORDER,
+            text_color=TEXT_PRIMARY, font=("Consolas", 13), state="disabled",
+        )
+        self.log.pack(fill="both", expand=True, pady=(6, 0))
 
     def log_message(self, message: str):
         timestamp = time.strftime("%H:%M:%S")
@@ -169,21 +242,21 @@ class AggroApp(tk.Tk):
         except queue.Empty:
             pass
         if messages:
-            self.log.config(state="normal")
+            self.log.configure(state="normal")
             self.log.insert(tk.END, "\n".join(messages) + "\n")
             line_count = int(self.log.index("end-1c").split(".")[0])
             if line_count > 500:
                 self.log.delete("1.0", f"{line_count - 500}.0")
             self.log.see(tk.END)
-            self.log.config(state="disabled")
+            self.log.configure(state="disabled")
         self.after(50, self._drain_log_queue)
 
     def load_templates(self):
-        self.template_list.delete(0, tk.END)
         self.templates = []
 
         if not self.template_dir.exists():
             self.log_message("Dossier templates introuvable.")
+            self.templates_count_var.set("dossier introuvable")
             return
 
         for path in sorted(self.template_dir.iterdir()):
@@ -192,63 +265,70 @@ class AggroApp(tk.Tk):
             if path.suffix.lower() not in {".png", ".jpg", ".jpeg", ".bmp"}:
                 continue
             self.templates.append(path)
-            self.template_list.insert(tk.END, path.name)
 
+        self.templates_count_var.set(f"{len(self.templates)} chargé(s)")
         if self.templates:
-            self.template_list.select_set(0)
-            self.on_template_selected(None)
             self.log_message(f"{len(self.templates)} template(s) chargée(s).")
         else:
             self.log_message("Aucun template trouvé dans le dossier templates.")
 
-    def on_template_selected(self, _event):
-        selection = self.template_list.curselection()
-        if not selection:
-            self.selected_template = None
-            return
-        path = self.templates[selection[0]]
-        self.selected_template = path
+    def open_template_folder(self):
+        import subprocess
+        self.template_dir.mkdir(parents=True, exist_ok=True)
+        subprocess.Popen(["explorer", str(self.template_dir)])
 
-    def parse_roi(self):
-        text = self.roi_var.get().strip()
-        values = text.split()
-        if len(values) != 4:
-            raise ValueError("ROI attendue : x y w h")
-        roi = tuple(int(v) for v in values)
-        if roi[2] <= 0 or roi[3] <= 0:
-            raise ValueError("La largeur et la hauteur de la ROI doivent être positives")
-        return roi
+    @staticmethod
+    def _get_window_roi(hwnd):
+        """Zone de capture = la zone client de la fenêtre choisie (hors bordures/
+        barre de titre), recalculée à chaque appel donc toujours à jour même si la
+        fenêtre a été déplacée depuis la sélection dans la liste."""
+        if not hwnd or not user32.IsWindow(hwnd):
+            raise ValueError("La fenêtre sélectionnée n'existe plus — choisis-la à nouveau dans la liste.")
+        rect = wintypes.RECT()
+        user32.GetClientRect(hwnd, ctypes.byref(rect))
+        origin = wintypes.POINT(0, 0)
+        user32.ClientToScreen(hwnd, ctypes.byref(origin))
+        width, height = rect.right - rect.left, rect.bottom - rect.top
+        if width <= 0 or height <= 0:
+            raise ValueError("La fenêtre sélectionnée est minimisée ou de taille nulle.")
+        return (origin.x, origin.y, width, height)
 
     def start_bot(self):
         if self.running:
             self.log_message("Le bot tourne déjà.")
             return
+        if not self.selected_hwnd:
+            messagebox.showerror("Fenêtre manquante", "Choisis la fenêtre du jeu dans la liste avant de démarrer.")
+            return
         try:
             threshold = float(self.score_var.get())
-            roi = self.parse_roi()
-            scan_delay = max(0, int(self.delay_var.get())) / 1000.0
             click_delay = max(0, int(self.click_delay_var.get())) / 1000.0
+            roi = self._get_window_roi(self.selected_hwnd)
         except Exception as exc:
             messagebox.showerror("Paramètre invalide", str(exc))
             return
 
         background_input = self.background_input_var.get()
+        scan_delay = 0.05
         self.running = True
         self.stop_event.clear()
         self.status_var.set("Démarrage...")
-        self.log_message(f"Démarrage du bot | mode=frames | seuil={threshold} | délai={int(scan_delay*1000)}ms | clic->F1={int(click_delay*1000)}ms | arrière-plan={background_input}")
+        self.log_message(f"Démarrage du bot | mode=frames | seuil={threshold} | clic->F1={int(click_delay*1000)}ms | arrière-plan={background_input}")
         self.log_message(f"Capture : x={roi[0]} y={roi[1]} w={roi[2]} h={roi[3]}")
         self.bot_thread = threading.Thread(
             target=self.bot_loop,
-            args=(threshold, roi, scan_delay, click_delay, background_input),
+            args=(threshold, roi, scan_delay, click_delay, background_input, self.selected_hwnd),
             daemon=True,
         )
         self.bot_thread.start()
 
     def test_capture(self):
         import subprocess
+        if not self.selected_hwnd:
+            self.log_message("Choisis la fenêtre du jeu dans la liste avant de tester la capture.")
+            return
         try:
-            roi = self.parse_roi()
+            roi = self._get_window_roi(self.selected_hwnd)
         except Exception as exc:
             self.log_message(f"ROI invalide : {exc}")
             return
@@ -287,13 +367,20 @@ class AggroApp(tk.Tk):
     def _on_dungeon_hotkey(self, _event=None):
         self.start_dungeon()
 
-    def open_template_capture(self):
+    def _open_capture_widget(self, target_dir):
         from template_capture_widget import TemplateCaptureWidget
-        TemplateCaptureWidget(self, self.template_dir)
+        if self._capture_widget is not None and self._capture_widget.window.winfo_exists():
+            self.log_message("Une fenêtre de capture est déjà ouverte — ferme-la avant d'en ouvrir une autre.")
+            self._capture_widget.window.lift()
+            self._capture_widget.window.focus_force()
+            return
+        self._capture_widget = TemplateCaptureWidget(self, target_dir)
+
+    def open_template_capture(self):
+        self._open_capture_widget(self.template_dir)
 
     def open_dungeon_marker_capture(self):
-        from template_capture_widget import TemplateCaptureWidget
-        TemplateCaptureWidget(self, self.dungeon_marker_dir)
+        self._open_capture_widget(self.dungeon_marker_dir)
 
     def load_dungeon_markers(self):
         self.dungeon_markers = []
@@ -334,116 +421,50 @@ class AggroApp(tk.Tk):
         self.dungeon_active = False
         self.log_message("Mode donjon désactivé — retour à la carte extérieure ne relancera plus de donjon (farm classique maintenu).")
 
-    def _populate_monitors(self):
-        try:
-            with mss.mss() as sct:
-                self._monitors = list(sct.monitors[1:])
-        except Exception as exc:
-            self.log_message(f"Erreur énumération écrans : {exc}")
+    def _populate_windows(self):
+        self._window_handles = []
+
+        def enum_proc(hwnd, _lparam):
+            if not user32.IsWindowVisible(hwnd):
+                return True
+            length = user32.GetWindowTextLengthW(hwnd)
+            if length == 0:
+                return True
+            buf = ctypes.create_unicode_buffer(length + 1)
+            user32.GetWindowTextW(hwnd, buf, length + 1)
+            title = buf.value.strip()
+            if title:
+                self._window_handles.append((hwnd, title))
+            return True
+
+        user32.EnumWindows(WNDENUMPROC(enum_proc), 0)
+
+        # étiquettes uniques pour le combobox (au cas où deux fenêtres partagent le même titre)
+        self._window_title_to_hwnd = {}
+        titles = []
+        seen = {}
+        for hwnd, title in self._window_handles:
+            seen[title] = seen.get(title, 0) + 1
+            label = title if seen[title] == 1 else f"{title} ({seen[title]})"
+            titles.append(label)
+            self._window_title_to_hwnd[label] = hwnd
+
+        self.window_combo.configure(values=titles)
+        if not titles:
+            self.log_message("Aucune fenêtre détectée.")
             return
-        labels = []
-        for i, m in enumerate(self._monitors, start=1):
-            tag = "  ★ principal" if m["left"] == 0 and m["top"] == 0 else ""
-            labels.append(f"Écran {i}  –  {m['width']}×{m['height']}  @  ({m['left']}, {m['top']}){tag}")
-        self.monitor_combo["values"] = labels
-        if not labels:
-            self.log_message("Aucun écran détecté.")
+        # essaie de conserver la sélection précédente si elle existe encore
+        default = next((label for label, hwnd in self._window_title_to_hwnd.items() if hwnd == self.selected_hwnd), titles[0])
+        self.window_combo.set(default)
+        self._on_window_selected(default)
+        self.log_message(f"{len(titles)} fenêtre(s) détectée(s). Sélectionnée : {default}")
+
+    def _on_window_selected(self, label):
+        hwnd = self._window_title_to_hwnd.get(label)
+        if not hwnd:
             return
-        # pré-sélectionne l'écran secondaire si présent, sinon le premier
-        default = next((i for i, m in enumerate(self._monitors) if m["left"] != 0 or m["top"] != 0), 0)
-        self.monitor_combo.current(default)
-        self._on_monitor_selected()
-        self.log_message(f"{len(labels)} écran(s) détecté(s). Sélectionné : {labels[default]}")
-
-    def _on_monitor_selected(self, event=None):
-        idx = self.monitor_combo.current()
-        if idx < 0 or idx >= len(self._monitors):
-            return
-        m = self._monitors[idx]
-        self._monitor_index = idx + 1
-        self.roi_var.set(f"{m['left']} {m['top']} {m['width']} {m['height']}")
-
-    def select_roi_visually(self):
-        bbox = self._run_roi_overlay(self._monitor_index)
-        if bbox:
-            left, top, right, bottom = bbox
-            self.roi_var.set(f"{left} {top} {right - left} {bottom - top}")
-            self.log_message(f"ROI mise à jour : x={left} y={top} w={right - left} h={bottom - top}")
-
-    def _run_roi_overlay(self, monitor_index: int):
-        try:
-            with mss.mss() as sct:
-                if monitor_index < 1 or monitor_index >= len(sct.monitors):
-                    monitor_index = 1
-                m = sct.monitors[monitor_index]
-                mon_left, mon_top, mon_w, mon_h = m["left"], m["top"], m["width"], m["height"]
-        except Exception:
-            mon_left, mon_top, mon_w, mon_h = 0, 0, 1920, 1080
-
-        overlay = tk.Toplevel(self)
-        overlay.geometry(f"{mon_w}x{mon_h}+{mon_left}+{mon_top}")
-        overlay.attributes("-alpha", 0.25)
-        overlay.attributes("-topmost", True)
-        overlay.configure(bg="black")
-        overlay.overrideredirect(True)
-        overlay.lift()
-        overlay.focus_force()
-
-        canvas = tk.Canvas(overlay, cursor="crosshair", bg="black", highlightthickness=0)
-        canvas.pack(fill=tk.BOTH, expand=True)
-        overlay.update()
-
-        cx0 = cy0 = None
-        rect_id = None
-        selected = {}
-
-        def on_press(event):
-            nonlocal cx0, cy0, rect_id
-            cx0, cy0 = event.x, event.y
-            selected["x1"] = mon_left + event.x
-            selected["y1"] = mon_top + event.y
-            if rect_id:
-                canvas.delete(rect_id)
-            rect_id = canvas.create_rectangle(cx0, cy0, cx0, cy0, outline="cyan", width=2)
-
-        def on_drag(event):
-            nonlocal rect_id
-            selected["x2"] = mon_left + event.x
-            selected["y2"] = mon_top + event.y
-            if rect_id:
-                canvas.delete(rect_id)
-            rect_id = canvas.create_rectangle(cx0, cy0, event.x, event.y, outline="cyan", width=2)
-
-        def on_release(event):
-            selected["x2"] = mon_left + event.x
-            selected["y2"] = mon_top + event.y
-            overlay.destroy()
-
-        canvas.bind("<ButtonPress-1>", on_press)
-        canvas.bind("<B1-Motion>", on_drag)
-        canvas.bind("<ButtonRelease-1>", on_release)
-        overlay.bind("<Escape>", lambda _: overlay.destroy())
-        overlay.wait_window()
-
-        if "x1" not in selected or "x2" not in selected:
-            return None
-        left = min(selected["x1"], selected["x2"])
-        top = min(selected["y1"], selected["y2"])
-        right = max(selected["x1"], selected["x2"])
-        bottom = max(selected["y1"], selected["y2"])
-        if right - left < 2 or bottom - top < 2:
-            return None
-        return (left, top, right, bottom)
-
-    @staticmethod
-    def _resolve_window_at(x, y):
-        """Résout le hwnd de la fenêtre visible à (x, y). À appeler une seule fois
-        au démarrage du bot (le jeu doit être visible à cet endroit à ce moment-là) :
-        le hwnd obtenu reste valable ensuite même si une autre fenêtre recouvre le
-        jeu, contrairement à une résolution refaite à chaque clic."""
-        point = wintypes.POINT(x, y)
-        hwnd = user32.WindowFromPoint(point)
-        return hwnd if hwnd else None
+        self.selected_hwnd = hwnd
+        self.log_message(f"Fenêtre du jeu : {label} (hwnd={hwnd})")
 
     @staticmethod
     def _background_click(hwnd, x, y):
@@ -495,7 +516,7 @@ class AggroApp(tk.Tk):
             user32.PostMessageW(hwnd, WM_KEYUP, VK_SHIFT, 0)
         return True
 
-    def bot_loop(self, threshold: float, roi, scan_delay: float = 0.05, click_delay: float = 0.2, background_input: bool = True):
+    def bot_loop(self, threshold: float, roi, scan_delay: float = 0.05, click_delay: float = 0.2, background_input: bool = True, game_hwnd=None):
         templates = [(p, self._load_template(p)) for p in self.templates]
         templates = [(p, img) for p, img in templates if img is not None]
         if not templates:
@@ -510,15 +531,9 @@ class AggroApp(tk.Tk):
         template_priority = {path: 0.0 for path, _variants, _label in templates_to_match}
         fast_match_score = max(threshold, 0.90)
 
-        game_hwnd = None
-        if background_input:
-            left, top, width, height = roi
-            game_hwnd = self._resolve_window_at(left + width // 2, top + height // 2)
-            if game_hwnd:
-                self.log_message(f"Fenêtre du jeu verrouillée (hwnd={game_hwnd}) : les clics resteront ciblés dessus même si elle est recouverte.")
-            else:
-                self.log_message("Impossible de trouver la fenêtre du jeu au démarrage (assure-toi qu'elle est visible à cet endroit) — passage en clic physique.")
-                background_input = False
+        if background_input and not game_hwnd:
+            self.log_message("Fenêtre du jeu introuvable — passage en clic physique.")
+            background_input = False
         self.game_hwnd = game_hwnd
 
         left, top, width, height = roi

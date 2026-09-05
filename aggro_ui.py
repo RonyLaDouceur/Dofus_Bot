@@ -537,6 +537,10 @@ class AggroApp(tk.Tk):
             return None
 
     def _find_match(self, edge_frame, template_variants, threshold):
+        """Un seul matchTemplate par échelle (pas de recadrages multiples) : avec
+        des dizaines de templates chargés, l'ancien recadrage x4 par échelle rendait
+        chaque scan très lent dès qu'aucune cible ne matchait vite (voir logs :
+        plusieurs dizaines de secondes de silence après quelques clics)."""
         best = None
         best_score = 0.0
         for scaled_tpl in template_variants:
@@ -544,27 +548,12 @@ class AggroApp(tk.Tk):
             if template_w >= edge_frame.shape[1] or template_h >= edge_frame.shape[0]:
                 continue
 
-            for center_fraction in (0.4, 0.6, 0.8, 1.0):
-                match_w = max(8, int(template_w * center_fraction))
-                match_h = max(8, int(template_h * center_fraction))
-                match_w = min(match_w, template_w)
-                match_h = min(match_h, template_h)
-                offset_x = (template_w - match_w) // 2
-                offset_y = (template_h - match_h) // 2
-                centered_tpl = scaled_tpl[
-                    offset_y:offset_y + match_h,
-                    offset_x:offset_x + match_w,
-                ]
-                if centered_tpl.shape[1] >= edge_frame.shape[1] or centered_tpl.shape[0] >= edge_frame.shape[0]:
-                    continue
-
-                result = cv2.matchTemplate(edge_frame, centered_tpl, cv2.TM_CCOEFF_NORMED)
-                _, score, _, loc = cv2.minMaxLoc(result)
-                if score > best_score:
-                    best_score = score
-                if score >= threshold:
-                    best = (loc[0], loc[1], match_w, match_h, float(score))
-                    return best, best_score
+            result = cv2.matchTemplate(edge_frame, scaled_tpl, cv2.TM_CCOEFF_NORMED)
+            _, score, _, loc = cv2.minMaxLoc(result)
+            if score > best_score:
+                best_score = score
+            if score >= threshold and (best is None or score > best[4]):
+                best = (loc[0], loc[1], template_w, template_h, float(score))
         return best, best_score
 
 

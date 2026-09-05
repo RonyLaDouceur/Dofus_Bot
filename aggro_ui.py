@@ -1,4 +1,5 @@
 import ctypes
+from ctypes import wintypes
 import queue
 import logging
 from logging.handlers import RotatingFileHandler
@@ -14,6 +15,25 @@ import cv2
 import mss
 import numpy as np
 import pyautogui
+
+user32 = ctypes.windll.user32
+user32.WindowFromPoint.restype = wintypes.HWND
+user32.WindowFromPoint.argtypes = [wintypes.POINT]
+user32.ScreenToClient.argtypes = [wintypes.HWND, ctypes.POINTER(wintypes.POINT)]
+user32.PostMessageW.argtypes = [wintypes.HWND, wintypes.UINT, wintypes.WPARAM, wintypes.LPARAM]
+user32.PostMessageW.restype = wintypes.BOOL
+user32.MapVirtualKeyW.argtypes = [wintypes.UINT, wintypes.UINT]
+user32.MapVirtualKeyW.restype = wintypes.UINT
+user32.VkKeyScanW.argtypes = [wintypes.WCHAR]
+user32.VkKeyScanW.restype = ctypes.c_short
+
+WM_LBUTTONDOWN = 0x0201
+WM_LBUTTONUP = 0x0202
+WM_KEYDOWN = 0x0100
+WM_KEYUP = 0x0101
+MK_LBUTTON = 0x0001
+VK_F1 = 0x70
+VK_SHIFT = 0x10
 
 
 class AggroApp(tk.Tk):
@@ -32,14 +52,19 @@ class AggroApp(tk.Tk):
                 pass
 
         self.template_dir = Path(__file__).resolve().parent / "templates"
+        self.dungeon_marker_dir = Path(__file__).resolve().parent / "dungeon_markers"
+        self.dungeon_marker_dir.mkdir(parents=True, exist_ok=True)
         self.log_dir = Path(__file__).resolve().parent / "logs"
         self.log_dir.mkdir(parents=True, exist_ok=True)
         self.logger = self._build_logger()
         self.templates = []
+        self.dungeon_markers = []
         self.selected_template = None
         self.running = False
         self.stop_event = threading.Event()
         self.bot_thread = None
+        self.dungeon_active = False
+        self.game_hwnd = None
         self._monitors = []        # liste des moniteurs mss (sans le virtuel global)
         self._monitor_index = 1    # index mss 1-base
 
@@ -47,7 +72,9 @@ class AggroApp(tk.Tk):
         self._build_ui()
         self.bind_all("<F6>", self._toggle_bot_hotkey)
         self.bind_all("<F7>", self._on_stop_hotkey)
+        self.bind_all("<F8>", self._on_dungeon_hotkey)
         self.load_templates()
+        self.load_dungeon_markers()
         self.after(50, self._drain_log_queue)
         self.after(100, self._populate_monitors)
 
@@ -87,12 +114,26 @@ class AggroApp(tk.Tk):
         ttk.Entry(form, textvariable=self.click_delay_var, width=7).grid(row=3, column=1, sticky="w", pady=4)
         ttk.Label(form, text="Mode : comparaison de frames").grid(row=3, column=2, columnspan=3, sticky="w", pady=4)
 
+        self.background_input_var = tk.BooleanVar(value=True)
+        ttk.Checkbutton(
+            form,
+            text="Clic/touche en arrière-plan (ne bouge pas ta souris)",
+            variable=self.background_input_var,
+        ).grid(row=4, column=0, columnspan=5, sticky="w", pady=(4, 0))
+
         buttons = ttk.Frame(main)
         buttons.pack(fill="x", pady=(4, 10))
         ttk.Button(buttons, text="Démarrer", command=self.start_bot).pack(side="left", padx=(0, 8))
         ttk.Button(buttons, text="Arrêter", command=self.stop_bot).pack(side="left", padx=(0, 8))
         ttk.Button(buttons, text="Ajouter un template", command=self.open_template_capture).pack(side="left", padx=(0, 8))
         ttk.Button(buttons, text="📸 Tester capture", command=self.test_capture).pack(side="left")
+
+        dungeon_buttons = ttk.Frame(main)
+        dungeon_buttons.pack(fill="x", pady=(0, 10))
+        ttk.Button(dungeon_buttons, text="🏰 Lancer un donjon (F8)", command=self.start_dungeon).pack(side="left", padx=(0, 8))
+        ttk.Button(dungeon_buttons, text="Sortir du mode donjon", command=self.stop_dungeon).pack(side="left", padx=(0, 8))
+        ttk.Button(dungeon_buttons, text="Capturer repère sortie donjon", command=self.open_dungeon_marker_capture).pack(side="left", padx=(0, 8))
+        ttk.Button(dungeon_buttons, text="🔄", command=self.load_dungeon_markers, width=3).pack(side="left")
 
         ttk.Label(main, text="Log", font=("Segoe UI", 11, "bold")).pack(anchor="w")
         self.status_var = tk.StringVar(value="Prêt")
@@ -191,14 +232,15 @@ class AggroApp(tk.Tk):
             messagebox.showerror("Paramètre invalide", str(exc))
             return
 
+        background_input = self.background_input_var.get()
         self.running = True
         self.stop_event.clear()
         self.status_var.set("Démarrage...")
-        self.log_message(f"Démarrage du bot | mode=frames | seuil={threshold} | délai={int(scan_delay*1000)}ms | clic->F1={int(click_delay*1000)}ms")
+        self.log_message(f"Démarrage du bot | mode=frames | seuil={threshold} | délai={int(scan_delay*1000)}ms | clic->F1={int(click_delay*1000)}ms | arrière-plan={background_input}")
         self.log_message(f"Capture : x={roi[0]} y={roi[1]} w={roi[2]} h={roi[3]}")
         self.bot_thread = threading.Thread(
             target=self.bot_loop,
-            args=(threshold, roi, scan_delay, click_delay),
+            args=(threshold, roi, scan_delay, click_delay, background_input),
             daemon=True,
         )
         self.bot_thread.start()
@@ -242,9 +284,55 @@ class AggroApp(tk.Tk):
     def _on_stop_hotkey(self, _event=None):
         self.stop_bot()
 
+    def _on_dungeon_hotkey(self, _event=None):
+        self.start_dungeon()
+
     def open_template_capture(self):
         from template_capture_widget import TemplateCaptureWidget
         TemplateCaptureWidget(self, self.template_dir)
+
+    def open_dungeon_marker_capture(self):
+        from template_capture_widget import TemplateCaptureWidget
+        TemplateCaptureWidget(self, self.dungeon_marker_dir)
+
+    def load_dungeon_markers(self):
+        self.dungeon_markers = []
+        if not self.dungeon_marker_dir.exists():
+            return
+        for path in sorted(self.dungeon_marker_dir.iterdir()):
+            if not path.is_file() or path.suffix.lower() not in {".png", ".jpg", ".jpeg", ".bmp"}:
+                continue
+            image = cv2.imread(str(path), cv2.IMREAD_COLOR)
+            if image is not None:
+                self.dungeon_markers.append((path, image))
+        self.log_message(f"{len(self.dungeon_markers)} repère(s) de sortie de donjon chargé(s).")
+
+    def _send_dungeon_potion(self):
+        if self.background_input_var.get() and self.game_hwnd:
+            self._background_key_char(self.game_hwnd, "&")
+        else:
+            pyautogui.press("&")
+
+    def start_dungeon(self):
+        if not self.running:
+            self.log_message("Démarre d'abord le bot avant de lancer un donjon.")
+            return
+        if self.dungeon_active:
+            self.log_message("Un donjon est déjà en cours.")
+            return
+        if not self.dungeon_markers:
+            self.log_message("Aucun repère de sortie de donjon capturé — la fin du donjon ne sera pas détectée.")
+
+        self._send_dungeon_potion()
+        self.dungeon_active = True
+        self.log_message("Entrée en donjon demandée (touche & envoyée). Farm maintenu ; un nouveau donjon sera relancé automatiquement à chaque retour détecté (jusqu'à Sortir du mode donjon ou Arrêter le bot).")
+
+    def stop_dungeon(self):
+        if not self.dungeon_active:
+            self.log_message("Le mode donjon n'est pas actif.")
+            return
+        self.dungeon_active = False
+        self.log_message("Mode donjon désactivé — retour à la carte extérieure ne relancera plus de donjon (farm classique maintenu).")
 
     def _populate_monitors(self):
         try:
@@ -347,7 +435,67 @@ class AggroApp(tk.Tk):
             return None
         return (left, top, right, bottom)
 
-    def bot_loop(self, threshold: float, roi, scan_delay: float = 0.05, click_delay: float = 0.2):
+    @staticmethod
+    def _resolve_window_at(x, y):
+        """Résout le hwnd de la fenêtre visible à (x, y). À appeler une seule fois
+        au démarrage du bot (le jeu doit être visible à cet endroit à ce moment-là) :
+        le hwnd obtenu reste valable ensuite même si une autre fenêtre recouvre le
+        jeu, contrairement à une résolution refaite à chaque clic."""
+        point = wintypes.POINT(x, y)
+        hwnd = user32.WindowFromPoint(point)
+        return hwnd if hwnd else None
+
+    @staticmethod
+    def _background_click(hwnd, x, y):
+        """Envoie un clic gauche directement au hwnd fourni via PostMessage, sans
+        bouger le curseur système : laisse l'utilisateur libre d'utiliser sa souris
+        (et de recouvrir la fenêtre du jeu) pendant que le bot tourne. Ne fonctionne
+        que si le jeu lit les messages Windows standards (pas l'input brut/DirectInput)."""
+        if not hwnd:
+            return False
+        client_point = wintypes.POINT(x, y)
+        user32.ScreenToClient(hwnd, ctypes.byref(client_point))
+        lparam = (client_point.y << 16) | (client_point.x & 0xFFFF)
+        user32.PostMessageW(hwnd, WM_LBUTTONDOWN, MK_LBUTTON, lparam)
+        time.sleep(0.02)
+        user32.PostMessageW(hwnd, WM_LBUTTONUP, 0, lparam)
+        return True
+
+    @staticmethod
+    def _background_key(hwnd, vk_code):
+        """Envoie une touche directement au hwnd fourni via PostMessage (même
+        logique que _background_click, voir plus haut)."""
+        if not hwnd:
+            return False
+        scan_code = user32.MapVirtualKeyW(vk_code, 0)
+        lparam_down = 1 | (scan_code << 16)
+        lparam_up = 1 | (scan_code << 16) | (1 << 30) | (1 << 31)
+        user32.PostMessageW(hwnd, WM_KEYDOWN, vk_code, lparam_down)
+        time.sleep(0.02)
+        user32.PostMessageW(hwnd, WM_KEYUP, vk_code, lparam_up)
+        return True
+
+    @staticmethod
+    def _background_key_char(hwnd, char):
+        """Comme _background_key, mais à partir d'un caractère (ex: '&') plutôt que
+        d'un code VK fixe : le caractère '&' n'est pas la même touche physique selon
+        la disposition clavier (touche '1' non-shiftée en AZERTY, Maj+7 en QWERTY),
+        VkKeyScanW retrouve la bonne touche pour la disposition active."""
+        if not hwnd:
+            return False
+        packed = user32.VkKeyScanW(char)
+        if packed == -1:
+            return False
+        vk_code = packed & 0xFF
+        needs_shift = bool((packed >> 8) & 0x01)
+        if needs_shift:
+            user32.PostMessageW(hwnd, WM_KEYDOWN, VK_SHIFT, 0)
+        AggroApp._background_key(hwnd, vk_code)
+        if needs_shift:
+            user32.PostMessageW(hwnd, WM_KEYUP, VK_SHIFT, 0)
+        return True
+
+    def bot_loop(self, threshold: float, roi, scan_delay: float = 0.05, click_delay: float = 0.2, background_input: bool = True):
         templates = [(p, self._load_template(p)) for p in self.templates]
         templates = [(p, img) for p, img in templates if img is not None]
         if not templates:
@@ -362,10 +510,23 @@ class AggroApp(tk.Tk):
         template_priority = {path: 0.0 for path, _variants, _label in templates_to_match}
         fast_match_score = max(threshold, 0.90)
 
+        game_hwnd = None
+        if background_input:
+            left, top, width, height = roi
+            game_hwnd = self._resolve_window_at(left + width // 2, top + height // 2)
+            if game_hwnd:
+                self.log_message(f"Fenêtre du jeu verrouillée (hwnd={game_hwnd}) : les clics resteront ciblés dessus même si elle est recouverte.")
+            else:
+                self.log_message("Impossible de trouver la fenêtre du jeu au démarrage (assure-toi qu'elle est visible à cet endroit) — passage en clic physique.")
+                background_input = False
+        self.game_hwnd = game_hwnd
+
         left, top, width, height = roi
         region = {"left": left, "top": top, "width": width, "height": height}
         last_found = False
         last_no_match_log = 0.0
+        last_dungeon_log = 0.0
+        dungeon_cooldown_until = 0.0
         debug_saved = False
         blocked_target = None
 
@@ -395,6 +556,30 @@ class AggroApp(tk.Tk):
                         except Exception as exc:
                             self.log_message(f"Erreur debug : {exc}")
                         debug_saved = True
+
+                    if self.dungeon_active and time.monotonic() >= dungeon_cooldown_until:
+                        # Relu à chaque frame (pas précalculé) : capturer/recharger un
+                        # repère pendant que le bot tourne doit être pris en compte
+                        # immédiatement, sans avoir à redémarrer le bot.
+                        best_marker_score = 0.0
+                        for marker_path, marker_img in self.dungeon_markers:
+                            marker_variants = self._prepare_template_variants(marker_img)
+                            marker_match, marker_score = self._find_match(frame_gray_small, frame_bgr, marker_variants, threshold)
+                            if marker_score > best_marker_score:
+                                best_marker_score = marker_score
+                            if marker_match is not None:
+                                self.log_message(f"Retour à la carte extérieure détecté ({marker_path.name}) — relance du donjon (touche &).")
+                                self._send_dungeon_potion()
+                                # Pause avant de re-vérifier les repères : laisse le temps de
+                                # quitter l'écran extérieur, sinon la même détection se
+                                # redéclenche en boucle sur les frames suivantes.
+                                dungeon_cooldown_until = time.monotonic() + 3.0
+                                break
+                        else:
+                            now = time.monotonic()
+                            if self.dungeon_markers and now - last_dungeon_log >= 5.0:
+                                self.log_message(f"En donjon... (meilleur repère de sortie : {best_marker_score:.3f})")
+                                last_dungeon_log = now
 
                     best_match = None
                     best_score_overall = 0.0
@@ -445,71 +630,22 @@ class AggroApp(tk.Tk):
                             continue
 
                     self.log_message(f"Cible : {best_name} score={score:.3f} | clic ({cx},{cy})")
-                    pyautogui.click(cx, cy)
-                    blocked_target = (best_name, cx, cy)
-                    time.sleep(click_delay)
-                    pyautogui.press("f1")
+                    if background_input:
+                        self._background_click(game_hwnd, cx, cy)
+                        blocked_target = (best_name, cx, cy)
+                        time.sleep(click_delay)
+                        self._background_key(game_hwnd, VK_F1)
+                    else:
+                        pyautogui.click(cx, cy)
+                        blocked_target = (best_name, cx, cy)
+                        time.sleep(click_delay)
+                        pyautogui.press("f1")
                     self.log_message("Clic + F1 envoyés.")
                     time.sleep(1.0)
                     last_no_match_log = 0.0
 
                 except Exception as exc:
                     self.log_message(f"Erreur bot : {exc}")
-                    time.sleep(0.5)
-        finally:
-            sct.close()
-            self.running = False
-            self.log_message("Bot arrêté.")
-
-    def motion_loop(self, roi, scan_delay: float):
-        left, top, width, height = roi
-        region = {"left": left, "top": top, "width": width, "height": height}
-        background = cv2.createBackgroundSubtractorMOG2(
-            history=120,
-            varThreshold=24,
-            detectShadows=False,
-        )
-        warmup_frames = 15
-        last_click = 0.0
-        sct = mss.mss()
-        try:
-            self.log_message("Détection mouvement active.")
-            while not self.stop_event.is_set():
-                try:
-                    shot = np.array(sct.grab(region))
-                    if shot.size == 0:
-                        time.sleep(0.5)
-                        continue
-                    gray = cv2.cvtColor(shot[:, :, :3], cv2.COLOR_BGR2GRAY)
-                    foreground = background.apply(gray, learningRate=0.02)
-                    if warmup_frames > 0:
-                        warmup_frames -= 1
-                        time.sleep(scan_delay)
-                        continue
-
-                    mask = cv2.morphologyEx(foreground, cv2.MORPH_OPEN, None, iterations=1)
-                    mask = cv2.dilate(mask, None, iterations=2)
-                    contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-                    candidates = []
-                    for contour in contours:
-                        area = cv2.contourArea(contour)
-                        if 80 <= area <= width * height * 0.25:
-                            x, y, contour_width, contour_height = cv2.boundingRect(contour)
-                            candidates.append((area, x, y, contour_width, contour_height))
-
-                    now = time.monotonic()
-                    if candidates and now - last_click >= 1.0:
-                        area, x, y, contour_width, contour_height = max(candidates)
-                        click_x = left + x + contour_width // 2
-                        click_y = top + y + contour_height // 2
-                        self.log_message(f"Mouvement détecté : zone={contour_width}x{contour_height} surface={int(area)} | clic ({click_x},{click_y})")
-                        pyautogui.click(click_x, click_y)
-                        time.sleep(0.12)
-                        pyautogui.press("f1")
-                        last_click = time.monotonic()
-                    time.sleep(scan_delay)
-                except Exception as exc:
-                    self.log_message(f"Erreur détection mouvement : {exc}")
                     time.sleep(0.5)
         finally:
             sct.close()
@@ -544,18 +680,6 @@ class AggroApp(tk.Tk):
             )
             variants.append((gray_small, color))
         return variants
-
-    def capture_roi(self, roi, monitor_index=1):
-        try:
-            left, top, width, height = roi
-            region = {"left": left, "top": top, "width": width, "height": height}
-            with mss.mss() as sct:
-                shot = np.array(sct.grab(region))
-                if shot.ndim == 3:
-                    return cv2.cvtColor(shot[:, :, :3], cv2.COLOR_BGRA2BGR)
-                return shot
-        except Exception:
-            return None
 
     @staticmethod
     def _color_confirm(frame_bgr, template_color, x, y, w, h):

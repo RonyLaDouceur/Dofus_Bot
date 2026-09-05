@@ -11,6 +11,8 @@ from PIL import Image, ImageTk
 
 
 class TemplateCaptureWidget:
+    DUPLICATE_THRESHOLD = 0.70  # au-delà, on considère que c'est très probablement le même mob déjà capturé
+
     def __init__(self, parent, template_dir: Path):
         self.parent = parent
         self.template_dir = template_dir
@@ -194,8 +196,45 @@ class TemplateCaptureWidget:
             shot = np.array(sct.grab(region))
             return Image.fromarray(cv2.cvtColor(shot, cv2.COLOR_BGRA2RGB))
 
+    def _find_most_similar(self, image: Image.Image):
+        """Compare la capture à tous les templates déjà présents dans le dossier
+        (redimensionnés à une taille commune, corrélation directe) pour repérer un
+        quasi-doublon avant de l'ajouter au pool — sans ça, les templates très
+        proches s'accumulent au fil des captures sans que ça se voie."""
+        candidate = cv2.resize(
+            cv2.cvtColor(np.array(image.convert("RGB")), cv2.COLOR_RGB2BGR),
+            (64, 64), interpolation=cv2.INTER_AREA,
+        )
+        best_name, best_score = None, 0.0
+        for path in self.template_dir.iterdir():
+            if not path.is_file() or path.suffix.lower() not in {".png", ".jpg", ".jpeg", ".bmp"}:
+                continue
+            existing = cv2.imread(str(path), cv2.IMREAD_COLOR)
+            if existing is None:
+                continue
+            existing_small = cv2.resize(existing, (64, 64), interpolation=cv2.INTER_AREA)
+            score = float(cv2.matchTemplate(candidate, existing_small, cv2.TM_CCOEFF_NORMED)[0, 0])
+            if score > best_score:
+                best_score, best_name = score, path.name
+        return best_name, best_score
+
+    def _confirm_if_duplicate(self, image: Image.Image) -> bool:
+        """Retourne False si l'utilisateur annule la sauvegarde suite à l'alerte de doublon."""
+        best_name, best_score = self._find_most_similar(image)
+        if best_name is None or best_score < self.DUPLICATE_THRESHOLD:
+            return True
+        return messagebox.askyesno(
+            "Template similaire déjà présent",
+            f"'{best_name}' ressemble beaucoup à cette capture (similarité {best_score:.2f}).\n"
+            "Sauvegarder quand même ?",
+            parent=self.window,
+        )
+
     def _save_image(self, image: Image.Image):
         try:
+            if not self._confirm_if_duplicate(image):
+                self._status_var.set("Capture annulée (doublon).")
+                return
             filename = self.build_template_filename(self.template_dir, self._auto_name())
             image.save(filename)
             self._status_var.set(f"✔ {filename.name} ({image.size[0]}x{image.size[1]}px)")
@@ -207,6 +246,9 @@ class TemplateCaptureWidget:
     def quick_capture(self):
         try:
             screenshot = self._capture_monitor(self.monitor_index)
+            if not self._confirm_if_duplicate(screenshot):
+                self._status_var.set("Capture annulée (doublon).")
+                return
             filename = self.build_template_filename(self.template_dir, self._auto_name())
             screenshot.save(filename)
             self._status_var.set(f"✔ {filename.name} ({screenshot.size[0]}x{screenshot.size[1]}px)")
